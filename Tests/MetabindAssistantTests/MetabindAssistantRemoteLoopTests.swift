@@ -260,6 +260,47 @@ struct MetabindAssistantRemoteLoopTests {
 
     // MARK: - Regression: local loop still works
 
+    @Test func remoteDoneEndTurnExitsEvenIfStreamNeverCloses() async {
+        // The Metabind agent proxy keeps the SSE/TCP connection open across
+        // turns. Before the streamResponse fix, the for-await in
+        // streamResponse would receive `.done(.endTurn)` but keep waiting
+        // for the AsyncStream to terminate; the upstream stream never
+        // closed, so `isProcessing` stayed true forever and the UI looked
+        // frozen. Reproduce here with a provider that yields a clean turn
+        // and then deliberately never calls `continuation.finish()`.
+        final class OpenStreamProvider: LLMProvider, @unchecked Sendable {
+            let runsToolsRemotely = true
+
+            func resetConversation() async {}
+
+            func stream(
+                messages: [LLMMessage],
+                tools: [LLMTool]?,
+                systemPrompt: String?
+            ) -> AsyncStream<LLMEvent> {
+                AsyncStream { continuation in
+                    Task {
+                        continuation.yield(.textDelta("hello"))
+                        continuation.yield(.done(stopReason: .endTurn))
+                        // Deliberately do NOT call continuation.finish().
+                        // The Task stays alive holding the continuation.
+                        try? await Task.sleep(nanoseconds: 60_000_000_000)
+                        continuation.finish()
+                    }
+                }
+            }
+        }
+
+        let provider = OpenStreamProvider()
+        let server = FakeMCPServer()
+        let assistant = MetabindAssistant(server: server, provider: provider)
+
+        assistant.send("hi")
+        await waitUntil(timeout: 1) { !assistant.isProcessing }
+
+        #expect(!assistant.isProcessing, ".done(.endTurn) must exit streamResponse even when the byte stream is still open")
+    }
+
     @Test func localProviderStillRunsMultiTurnToolLoop() async {
         // Turn 1: assistant emits a tool call, done.toolUse.
         // Turn 2: assistant emits the final text, done.endTurn.

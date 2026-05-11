@@ -458,6 +458,12 @@ public final class MetabindAssistant {
                         ))
                     }
                 }
+                // The agent signalled end-of-turn. Exit immediately instead
+                // of waiting for the byte stream to close — the Metabind
+                // agent proxy keeps the TCP connection open across turns,
+                // so the `for await` would otherwise hang forever and
+                // `isProcessing` would stay true.
+                return (totalText.isEmpty ? nil : totalText, toolCalls)
 
             case .toolResult(let toolCallId, let content, _, let isError):
                 // Remote loop: agent executed the tool and sent us the result.

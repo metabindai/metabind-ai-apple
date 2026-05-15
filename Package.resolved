@@ -1,13 +1,13 @@
 {
-  "originHash" : "195c316b0fe5d2f366600964848526ec0b14288ea70f564e8511c97b846fbfb3",
+  "originHash" : "7d3ea661d375c2935b2a8bfdeac94e0a574fce342efb7000c8553fb6b0b72eee",
   "pins" : [
     {
       "identity" : "bindjs-apple-binary",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/metabindai/bindjs-apple-binary.git",
       "state" : {
-        "revision" : "16e5ab2f51674ca4d25d53efbc1e0ecc3346b895",
-        "version" : "1.1.3"
+        "revision" : "5c6cf0b78c4dda6e95aa3c8228fe804217116eef",
+        "version" : "1.1.4"
       }
     },
     {

@@ -96,7 +96,7 @@ struct MetabindAssistantRemoteLoopTests {
         let events: [LLMEvent] = [
             .textDelta("Looking it up. "),
             .toolCallStart(index: 0, id: "toolu_1", name: "getWeather"),
-            .toolCallArgumentDelta(#"{"city":"NYC"}"#),
+            .toolCallArgumentDelta(index: 0, fragment: #"{"city":"NYC"}"#),
             .contentBlockStop(index: 0),
             .toolResult(
                 toolCallId: "toolu_1",

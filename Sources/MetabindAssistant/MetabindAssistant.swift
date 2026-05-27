@@ -359,8 +359,14 @@ public final class MetabindAssistant {
         let id: String
         let name: String
         var jsonFragment: String = ""
+        /// Authoritative parsed args, when the provider sent a
+        /// `toolCallArgumentsFinal` frame. Wins over `jsonFragment` parse
+        /// because partials may be absent or non-concatenating in some
+        /// provider paths (e.g. agent → OpenAI late-id).
+        var canonicalArgs: JSONValue?
 
         var arguments: JSONValue {
+            if let canonicalArgs { return canonicalArgs }
             guard let data = jsonFragment.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return .object([:]) }
@@ -426,15 +432,31 @@ public final class MetabindAssistant {
                 activeSessions[id] = session
                 conversation.append(.tool(session))
 
-            case .toolCallArgumentDelta(let fragment):
-                guard let lastKey = toolAccumulators.keys.sorted().last else { break }
-                toolAccumulators[lastKey]?.jsonFragment += fragment
+            case .toolCallArgumentDelta(let index, let fragment):
+                guard toolAccumulators[index] != nil else {
+                    log.warning("toolCallArgumentDelta for unknown index=\(index, privacy: .public); dropping")
+                    break
+                }
+                toolAccumulators[index]?.jsonFragment += fragment
 
-                if let acc = toolAccumulators[lastKey],
+                if let acc = toolAccumulators[index],
                    let session = activeSessions[acc.id],
                    let data = acc.jsonFragment.data(using: .utf8),
                    let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     session.feed(JSONValue.from(parsed))
+                }
+
+            case .toolCallArgumentsFinal(let index, let args):
+                guard toolAccumulators[index] != nil else {
+                    log.warning("toolCallArgumentsFinal for unknown index=\(index, privacy: .public); dropping")
+                    break
+                }
+                toolAccumulators[index]?.canonicalArgs = args
+                if let acc = toolAccumulators[index],
+                   let session = activeSessions[acc.id] {
+                    // Surface the canonical args to the live BindJS view —
+                    // matters when partials were absent or didn't parse.
+                    session.feed(args)
                 }
 
             case .contentBlockStop(let index):

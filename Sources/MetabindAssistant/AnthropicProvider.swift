@@ -140,8 +140,9 @@ public struct AnthropicProvider: LLMProvider {
                     if let text = delta["text"] as? String {
                         continuation.yield(.textDelta(text))
                     }
-                    if let partial = delta["partial_json"] as? String {
-                        continuation.yield(.toolCallArgumentDelta(partial))
+                    if let partial = delta["partial_json"] as? String,
+                       let index = json["index"] as? Int {
+                        continuation.yield(.toolCallArgumentDelta(index: index, fragment: partial))
                     }
                 }
 

@@ -58,8 +58,10 @@ struct Probe {
                 print("[\(t)] text_delta  \(truncated(text, 80))")
             case .toolCallStart(let index, let id, let name):
                 print("[\(t)] tool_start  index=\(index) id=\(id) name=\(name)")
-            case .toolCallArgumentDelta(let json):
-                print("[\(t)] tool_arg    \(truncated(json, 120))")
+            case .toolCallArgumentDelta(let index, let fragment):
+                print("[\(t)] tool_arg    index=\(index) \(truncated(fragment, 120))")
+            case .toolCallArgumentsFinal(let index, let arguments):
+                print("[\(t)] tool_final  index=\(index) \(truncated(String(describing: arguments), 160))")
             case .contentBlockStop(let index):
                 print("[\(t)] block_stop  index=\(index)")
             case .toolResult(let id, let content, let structured, let isError):

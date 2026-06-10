@@ -493,6 +493,56 @@ struct MetabindAgentProviderTests {
         #expect(messages.count == 3)
     }
 
+    /// The agent service rejects client-supplied tool protocol blocks with
+    /// `bad_request` — a fresh-conversation replay must strip them. (A reset()
+    /// racing the end of a streaming turn can orphan an assistant turn with
+    /// tool calls into a cleared history; that history must still be sendable.)
+    @Test func freshConversationStripsToolProtocolBlocks() async throws {
+        defer { MockURLProtocol.uninstall() }
+        let sse = """
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let provider = makeProvider(sse: sse)
+
+        let history: [LLMMessage] = [
+            .user("what's my net worth?"),
+            .assistant(text: "Here you go.", toolCalls: [
+                LLMToolCall(id: "toolu_1", name: "get_net_worth", arguments: .object([:])),
+            ]),
+            .toolResults([LLMToolResult(toolCallId: "toolu_1", content: "{}")]),
+            .assistant(text: nil, toolCalls: [
+                LLMToolCall(id: "toolu_2", name: "net_worth_trend", arguments: .object([:])),
+            ]), // tool-only turn: dropped entirely
+            .user("show me a graph"),
+        ]
+
+        _ = await collect(provider.stream(
+            messages: history, tools: nil, systemPrompt: nil
+        ))
+
+        let body = try #require(MockURLProtocol.capturedBody())
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        let messages = try #require(json["messages"] as? [[String: Any]])
+        #expect(messages.count == 3, "user, text-only assistant, user")
+
+        let serialized = String(data: body, encoding: .utf8) ?? ""
+        #expect(!serialized.contains("tool_use"))
+        #expect(!serialized.contains("tool_result"))
+
+        let assistant = try #require(
+            messages.first(where: { $0["role"] as? String == "assistant" })
+        )
+        let blocks = try #require(assistant["content"] as? [[String: Any]])
+        #expect(blocks.count == 1)
+        #expect(blocks[0]["type"] as? String == "text")
+        #expect(blocks[0]["text"] as? String == "Here you go.")
+    }
+
     @Test func resetConversationClearsId() async {
         defer { MockURLProtocol.uninstall() }
         let sse = """
@@ -560,96 +610,4 @@ struct MetabindAgentProviderTests {
         #expect(provider.runsToolsRemotely)
     }
 
-    // MARK: - Message encoding
-
-    @Test func assistantMessageEncodesAsContentBlocks() async throws {
-        defer { MockURLProtocol.uninstall() }
-        let sse = """
-        event: message_stop
-        data: {"stopReason":"end_turn"}
-
-
-        """
-        let provider = makeProvider(sse: sse)
-
-        let history: [LLMMessage] = [
-            .user("hi"),
-            .assistant(
-                text: "thinking...",
-                toolCalls: [LLMToolCall(
-                    id: "toolu_1",
-                    name: "lookup",
-                    arguments: .object(["q": .string("weather")])
-                )]
-            ),
-            .toolResults([LLMToolResult(
-                toolCallId: "toolu_1",
-                content: "sunny",
-                isError: false
-            )]),
-            .user("continue"),
-        ]
-
-        _ = await collect(provider.stream(
-            messages: history, tools: nil, systemPrompt: nil
-        ))
-
-        let body = try #require(MockURLProtocol.capturedBody())
-        let json = try #require(
-            try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        )
-        let messages = try #require(json["messages"] as? [[String: Any]])
-
-        // First turn with no conversationId, full history serialized.
-        #expect(messages.count == 4)
-
-        // Assistant message = role "assistant", content blocks = [text, tool_use]
-        #expect(messages[1]["role"] as? String == "assistant")
-        let assistantBlocks = try #require(messages[1]["content"] as? [[String: Any]])
-        #expect(assistantBlocks.count == 2)
-        #expect(assistantBlocks[0]["type"] as? String == "text")
-        #expect(assistantBlocks[0]["text"] as? String == "thinking...")
-        #expect(assistantBlocks[1]["type"] as? String == "tool_use")
-        #expect(assistantBlocks[1]["id"] as? String == "toolu_1")
-        #expect(assistantBlocks[1]["name"] as? String == "lookup")
-
-        // toolResults encode as role "user" with tool_result blocks.
-        #expect(messages[2]["role"] as? String == "user")
-        let toolResultBlocks = try #require(messages[2]["content"] as? [[String: Any]])
-        #expect(toolResultBlocks.count == 1)
-        #expect(toolResultBlocks[0]["type"] as? String == "tool_result")
-        #expect(toolResultBlocks[0]["tool_use_id"] as? String == "toolu_1")
-        #expect(toolResultBlocks[0]["content"] as? String == "sunny")
-        #expect(toolResultBlocks[0]["is_error"] == nil) // not emitted when false
-    }
-
-    @Test func errorToolResultEncodesIsError() async throws {
-        defer { MockURLProtocol.uninstall() }
-        let sse = """
-        event: message_stop
-        data: {"stopReason":"end_turn"}
-
-
-        """
-        let provider = makeProvider(sse: sse)
-
-        let history: [LLMMessage] = [
-            .toolResults([LLMToolResult(
-                toolCallId: "t1",
-                content: "boom",
-                isError: true
-            )]),
-        ]
-
-        _ = await collect(provider.stream(
-            messages: history, tools: nil, systemPrompt: nil
-        ))
-        let body = try #require(MockURLProtocol.capturedBody())
-        let json = try #require(
-            try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        )
-        let messages = try #require(json["messages"] as? [[String: Any]])
-        let blocks = try #require(messages[0]["content"] as? [[String: Any]])
-        #expect(blocks[0]["is_error"] as? Bool == true)
-    }
 }

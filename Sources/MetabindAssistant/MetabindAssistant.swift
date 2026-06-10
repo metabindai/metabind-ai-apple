@@ -285,6 +285,12 @@ public final class MetabindAssistant {
         if provider.runsToolsRemotely {
             log.info("turn start (remote-loop)")
             let (assistantText, toolCalls) = try await streamResponse()
+            // Re-check after the suspension point: a reset() that interleaved
+            // here has already cleared `llmHistory`, and appending the orphan
+            // assistant turn (with its tool_use blocks) would poison the next
+            // conversation — the agent service 400s client-supplied tool
+            // protocol blocks.
+            try Task.checkCancellation()
             llmHistory.append(.assistant(text: assistantText, toolCalls: toolCalls))
             let elapsed = Int(Date().timeIntervalSince(turnStart) * 1000)
             log.info("turn end (remote-loop) \(elapsed, privacy: .public)ms textBytes=\(assistantText?.count ?? 0, privacy: .public) toolCalls=\(toolCalls.count, privacy: .public)")
@@ -302,6 +308,9 @@ public final class MetabindAssistant {
 
             let (assistantText, toolCalls) = try await streamResponse()
 
+            // Same orphan-append guard as the remote loop: reset() may have
+            // cleared the history while streamResponse was suspended.
+            try Task.checkCancellation()
             llmHistory.append(.assistant(text: assistantText, toolCalls: toolCalls))
 
             if toolCalls.isEmpty { return }

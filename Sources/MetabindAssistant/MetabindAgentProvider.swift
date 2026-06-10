@@ -276,8 +276,11 @@ public actor MetabindAgentProvider: LLMProvider {
 
     /// On a resumed conversation, only the newest user turn is sent; the
     /// server merges it with persisted history. On a fresh conversation, the
-    /// full history is included.
-    private func scopedMessages(_ messages: [LLMMessage]) throws -> [[String: Any]] {
+    /// full history is included — minus tool protocol blocks, which the agent
+    /// service manages itself and rejects with `bad_request` when supplied by
+    /// the client. Replayed assistant turns keep their text; tool-only turns
+    /// and tool results are dropped.
+    func scopedMessages(_ messages: [LLMMessage]) throws -> [[String: Any]] {
         let scoped: [LLMMessage]
         if conversationId != nil {
             if let idx = messages.lastIndex(where: { if case .user = $0 { true } else { false } }) {
@@ -286,7 +289,17 @@ public actor MetabindAgentProvider: LLMProvider {
                 scoped = []
             }
         } else {
-            scoped = messages
+            scoped = messages.compactMap { message in
+                switch message {
+                case .user:
+                    return message
+                case .assistant(let text, _):
+                    guard let text, !text.isEmpty else { return nil }
+                    return .assistant(text: text, toolCalls: [])
+                case .toolResults:
+                    return nil
+                }
+            }
         }
         return scoped.map(Self.encode)
     }

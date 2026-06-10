@@ -13,7 +13,7 @@ let package = Package(
         .library(name: "MetabindAssistant", targets: ["MetabindAssistant"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/metabindai/bindjs-apple-binary.git", from: "1.1.4"),
+        .package(url: "https://github.com/metabindai/bindjs-apple-binary.git", from: "1.1.7"),
     ],
     targets: [
         .target(

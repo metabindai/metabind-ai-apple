@@ -372,6 +372,17 @@ public final class MetabindAssistant {
             else { return .object([:]) }
             return JSONValue.from(obj)
         }
+
+        /// True once usable arguments have arrived — either a canonical
+        /// `toolCallArgumentsFinal` frame or a `jsonFragment` that parses to a
+        /// JSON object. The end-of-stream sweep uses this to avoid shipping a
+        /// tool call we only ever saw a `toolCallStart` for (e.g. the agent
+        /// opened a tool block, then ended the turn without a terminal frame).
+        var hasArguments: Bool {
+            if canonicalArgs != nil { return true }
+            guard let data = jsonFragment.data(using: .utf8) else { return false }
+            return (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
+        }
     }
 
     private func streamResponse() async throws -> (
@@ -472,13 +483,26 @@ public final class MetabindAssistant {
 
             case .done:
                 for (_, acc) in toolAccumulators.sorted(by: { $0.key < $1.key }) {
-                    if !toolCalls.contains(where: { $0.id == acc.id }) {
-                        toolCalls.append(LLMToolCall(
-                            id: acc.id,
-                            name: acc.name,
-                            arguments: acc.arguments
+                    guard !toolCalls.contains(where: { $0.id == acc.id }) else { continue }
+                    guard acc.hasArguments else {
+                        // `toolCallStart` opened a bubble but no arguments ever
+                        // arrived (no terminal frame / contentBlockStop before
+                        // the turn ended). Don't ship an empty-args tool call
+                        // into history — a local loop would execute it — and
+                        // surface the stranded bubble as failed instead of
+                        // leaving it spinning.
+                        log.warning("dropping incomplete tool call id=\(acc.id, privacy: .public) name=\(acc.name, privacy: .public) — toolCallStart with no arguments at end of stream")
+                        activeSessions[acc.id]?.complete(with: ToolResult(
+                            text: "Tool call did not complete",
+                            isError: true
                         ))
+                        continue
                     }
+                    toolCalls.append(LLMToolCall(
+                        id: acc.id,
+                        name: acc.name,
+                        arguments: acc.arguments
+                    ))
                 }
                 // The agent signalled end-of-turn. Exit immediately instead
                 // of waiting for the byte stream to close — the Metabind

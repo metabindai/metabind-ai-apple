@@ -47,6 +47,16 @@ struct MetabindAgentProviderTests {
         return events
     }
 
+    /// Thread-safe call counter for multi-response MockURLProtocol handlers.
+    private final class TurnCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func next() -> Int {
+            lock.lock(); defer { lock.unlock() }
+            let v = n; n += 1; return v
+        }
+    }
+
     // MARK: - Request shape
 
     @Test func buildsExpectedRequest() async throws {
@@ -115,7 +125,7 @@ struct MetabindAgentProviderTests {
         #expect(texts == ["Hello, ", "world"])
     }
 
-    @Test func toolUseSynthesizesStartArgDeltaAndStop() async {
+    @Test func toolUseSynthesizesStartArgsFinalAndStop() async {
         defer { MockURLProtocol.uninstall() }
         let sse = """
         event: message_start
@@ -133,7 +143,7 @@ struct MetabindAgentProviderTests {
             messages: [.user("weather?")], tools: nil, systemPrompt: nil
         ))
 
-        // Expect: toolCallStart, toolCallArgumentDelta, contentBlockStop, done
+        // Expect: toolCallStart, toolCallArgumentsFinal, contentBlockStop, done
         #expect(events.count == 4)
         if case .toolCallStart(let index, let id, let name) = events[0] {
             #expect(index == 0)
@@ -142,16 +152,429 @@ struct MetabindAgentProviderTests {
         } else {
             Issue.record("expected .toolCallStart, got \(events[0])")
         }
-        if case .toolCallArgumentDelta(let json) = events[1] {
-            let parsed = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: String]
-            #expect(parsed == ["city": "NYC"])
+        if case .toolCallArgumentsFinal(let index, let args) = events[1] {
+            #expect(index == 0)
+            #expect(args == .object(["city": .string("NYC")]))
         } else {
-            Issue.record("expected .toolCallArgumentDelta, got \(events[1])")
+            Issue.record("expected .toolCallArgumentsFinal, got \(events[1])")
         }
         if case .contentBlockStop(let index) = events[2] {
             #expect(index == 0)
         } else {
             Issue.record("expected .contentBlockStop, got \(events[2])")
+        }
+    }
+
+    @Test func streamingToolUseEmitsStartPartialsAndStop() async {
+        defer { MockURLProtocol.uninstall() }
+        // MET-1197: the agent now forwards Anthropic's content_block_delta
+        // stream as `tool_use_start` + N× `tool_use_input_partial` +
+        // terminal `tool_use`. Concatenated partials must parse to the
+        // canonical input post-stop, per the Anthropic streaming contract.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_1","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"{\\"q\\":\\""}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"shoes"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_1","name":"search","input":{"q":"shoes"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("find shoes")], tools: nil, systemPrompt: nil
+        ))
+
+        // Expect: toolCallStart, 3× toolCallArgumentDelta, toolCallArgumentsFinal, contentBlockStop, done
+        #expect(events.count == 7)
+
+        if case .toolCallStart(let index, let id, let name) = events[0] {
+            #expect(index == 0)
+            #expect(id == "toolu_1")
+            #expect(name == "search")
+        } else {
+            Issue.record("expected .toolCallStart, got \(events[0])")
+        }
+
+        // Partial fragments are forwarded verbatim — not cumulative — and
+        // each carries the correct accumulator index.
+        let partials = events[1...3].compactMap { event -> (Int, String)? in
+            if case .toolCallArgumentDelta(let i, let s) = event { return (i, s) }
+            return nil
+        }
+        #expect(partials.map(\.0) == [0, 0, 0])
+        #expect(partials.map(\.1) == [#"{"q":""#, "shoes", #""}"#])
+        // Concatenation parses to the canonical object (Anthropic contract).
+        let concatenated = partials.map(\.1).joined()
+        let parsed = try? JSONSerialization.jsonObject(with: Data(concatenated.utf8)) as? [String: String]
+        #expect(parsed == ["q": "shoes"])
+
+        // The terminal `tool_use` emits ArgumentsFinal with the canonical
+        // parsed input — authoritative, used by the assistant even when
+        // partials don't concatenate cleanly.
+        if case .toolCallArgumentsFinal(let index, let args) = events[4] {
+            #expect(index == 0)
+            #expect(args == .object(["q": .string("shoes")]))
+        } else {
+            Issue.record("expected .toolCallArgumentsFinal, got \(events[4])")
+        }
+
+        if case .contentBlockStop(let index) = events[5] {
+            #expect(index == 0)
+        } else {
+            Issue.record("expected .contentBlockStop, got \(events[5])")
+        }
+
+        // The terminal `tool_use` must NOT re-emit toolCallStart — that
+        // would duplicate the bubble in the assistant UI.
+        let starts = events.filter { if case .toolCallStart = $0 { true } else { false } }
+        #expect(starts.count == 1)
+    }
+
+    @Test func twoStreamingToolCallsGetSeparateIndices() async {
+        defer { MockURLProtocol.uninstall() }
+        // Anthropic guarantees content blocks don't interleave, but the
+        // agent may emit two tool calls in the same turn (parallel-friendly
+        // models). Each gets its own index; ids don't collide.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_a","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_a","partialInput":"{\\"q\\":\\"a\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_a","name":"search","input":{"q":"a"}}
+
+        event: tool_use_start
+        data: {"id":"toolu_b","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_b","partialInput":"{\\"q\\":\\"b\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_b","name":"search","input":{"q":"b"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("two")], tools: nil, systemPrompt: nil
+        ))
+
+        let starts = events.compactMap { event -> (Int, String)? in
+            if case .toolCallStart(let i, let id, _) = event { return (i, id) }
+            return nil
+        }
+        #expect(starts.count == 2)
+        #expect(starts[0].0 == 0)
+        #expect(starts[0].1 == "toolu_a")
+        #expect(starts[1].0 == 1)
+        #expect(starts[1].1 == "toolu_b")
+
+        let stops = events.compactMap { event -> Int? in
+            if case .contentBlockStop(let i) = event { return i }
+            return nil
+        }
+        #expect(stops == [0, 1])
+    }
+
+    @Test func legacyTerminalOnlyToolUseFallsBackToOneShot() async {
+        defer { MockURLProtocol.uninstall() }
+        // Older agent build, or a provider that buffers server-side (per
+        // tool-input-streaming.test.ts, Google's path), emits only the
+        // terminal `tool_use` with no start/partial events. We synthesize
+        // Start/ArgumentsFinal/Stop so the assistant sees a complete bubble.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use
+        data: {"id":"toolu_legacy","name":"getWeather","input":{"city":"NYC"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("weather?")], tools: nil, systemPrompt: nil
+        ))
+
+        #expect(events.count == 4)
+        if case .toolCallStart(let index, let id, _) = events[0] {
+            #expect(index == 0)
+            #expect(id == "toolu_legacy")
+        } else {
+            Issue.record("expected .toolCallStart, got \(events[0])")
+        }
+        if case .toolCallArgumentsFinal(let index, let args) = events[1] {
+            #expect(index == 0)
+            #expect(args == .object(["city": .string("NYC")]))
+        } else {
+            Issue.record("expected .toolCallArgumentsFinal, got \(events[1])")
+        }
+        if case .contentBlockStop = events[2] {} else {
+            Issue.record("expected .contentBlockStop, got \(events[2])")
+        }
+    }
+
+    @Test func streamingToolUseWithoutPartialsStillCarriesCanonicalArgs() async {
+        defer { MockURLProtocol.uninstall() }
+        // The provider-agnostic agent contract allows 0..N
+        // `tool_use_input_partial` events between `tool_use_start` and
+        // `tool_use`. When N=0 — possible for very small inputs, the
+        // agent's Google synthetic-stream path under certain conditions,
+        // or any future provider that omits per-chunk forwarding — the
+        // terminal `tool_use.input` is the only source of canonical args.
+        // We must surface it via `toolCallArgumentsFinal`; otherwise the
+        // assistant accumulator parses an empty buffer and the tool call
+        // ships with `{}`.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_z","name":"ping"}
+
+        event: tool_use
+        data: {"id":"toolu_z","name":"ping","input":{"host":"example.com","timeoutMs":500}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("ping")], tools: nil, systemPrompt: nil
+        ))
+
+        // No partials at all. Sequence: start → argumentsFinal → stop → done.
+        #expect(events.count == 4)
+        let partialCount = events.filter {
+            if case .toolCallArgumentDelta = $0 { true } else { false }
+        }.count
+        #expect(partialCount == 0)
+        if case .toolCallArgumentsFinal(let index, let args) = events[1] {
+            #expect(index == 0)
+            #expect(args == .object([
+                "host": .string("example.com"),
+                "timeoutMs": .number(500),
+            ]))
+        } else {
+            Issue.record("expected .toolCallArgumentsFinal, got \(events[1])")
+        }
+    }
+
+    @Test func interleavedPartialsRouteByIdNotByLatestIndex() async {
+        defer { MockURLProtocol.uninstall() }
+        // The agent's cross-provider contract is id-tagged: nothing in
+        // `tool-input-streaming.test.ts` guarantees the proxy will keep
+        // partials for two open tool blocks strictly sequential. If a
+        // future provider (or a network reorder via the SSE buffer) lands
+        // a partial for tool A *after* tool B has started, the iOS
+        // provider must still attribute it to A via its index — not to
+        // whichever block opened last. This test pins index-routing.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_a","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_a","partialInput":"{\\"q\\":\\"a"}
+
+        event: tool_use_start
+        data: {"id":"toolu_b","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_b","partialInput":"{\\"q\\":\\"b\\"}"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_a","partialInput":"\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_b","name":"search","input":{"q":"b"}}
+
+        event: tool_use
+        data: {"id":"toolu_a","name":"search","input":{"q":"a"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("two")], tools: nil, systemPrompt: nil
+        ))
+
+        // For each tool, collect deltas in arrival order with their index.
+        let deltasByIndex: [(Int, String)] = events.compactMap { event in
+            if case .toolCallArgumentDelta(let i, let s) = event { return (i, s) }
+            return nil
+        }
+        // Expected:
+        //   index 0 (toolu_a): "{\"q\":\"a", "\"}"   → concat → {"q":"a"}
+        //   index 1 (toolu_b): "{\"q\":\"b\"}"       → already valid
+        let a = deltasByIndex.filter { $0.0 == 0 }.map(\.1).joined()
+        let b = deltasByIndex.filter { $0.0 == 1 }.map(\.1).joined()
+        let parsedA = try? JSONSerialization.jsonObject(with: Data(a.utf8)) as? [String: String]
+        let parsedB = try? JSONSerialization.jsonObject(with: Data(b.utf8)) as? [String: String]
+        #expect(parsedA == ["q": "a"])
+        #expect(parsedB == ["q": "b"])
+
+        // Crucially: the partial that arrived *after* tool B opened —
+        // tagged `toolu_a` — must route to index 0, not index 1. If the
+        // old "latest index" routing were still in effect, index 1 would
+        // see the trailing `"}` fragment and parse to `{"q":"b"}"}` (invalid).
+        let aDeltas = deltasByIndex.filter { $0.0 == 0 }.map(\.1)
+        #expect(aDeltas.contains(#""}"#))
+        let bDeltas = deltasByIndex.filter { $0.0 == 1 }.map(\.1)
+        #expect(!bDeltas.contains(#""}"#))
+    }
+
+    @Test func turnStateDoesNotLeakAcrossStreamInvocations() async {
+        defer { MockURLProtocol.uninstall() }
+        // Turn 1 opens `tool_use_start` for toolu_x then terminates via
+        // an `error` event before the terminal `tool_use` lands — i.e. the
+        // id stays unresolved. If the provider held this state at the
+        // actor level, turn 2 would either start at index 1 (counter
+        // leak) or find a pre-seeded id mapping for toolu_x (map leak).
+        // Both must not happen — per-turn state lives only within
+        // `run(...)`.
+
+        let turn1SSE = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_x","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_x","partialInput":"{\\"q\\":\\"orphan\\"}"}
+
+        event: error
+        data: {"code":"upstream_timeout","message":"provider timed out"}
+
+
+        """
+
+        let turn2SSE = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_x","name":"search"}
+
+        event: tool_use
+        data: {"id":"toolu_x","name":"search","input":{"q":"clean"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+
+        // MockURLProtocol uses a single static handler. Vend turn1 first,
+        // turn2 second using a captured counter.
+        let counter = TurnCounter()
+        let session = MockURLProtocol.install { _ in
+            let n = counter.next()
+            return n == 0 ? .sse(turn1SSE) : .sse(turn2SSE)
+        }
+        let provider = MetabindAgentProvider(
+            baseURL: Self.baseURL,
+            apiKey: "test-api-key",
+            orgId: "org_abc",
+            projectId: "proj_xyz",
+            conversationId: nil,
+            urlSession: session
+        )
+
+        // Turn 1: drain the stream so the orphan tool_use_start is left
+        // unresolved on the actor (it shouldn't be, but pre-fix it was).
+        _ = await collect(provider.stream(
+            messages: [.user("first")], tools: nil, systemPrompt: nil
+        ))
+
+        // Turn 2: fresh stream. Index must reset to 0; id mapping must
+        // not collide with the orphan from turn 1.
+        let events2 = await collect(provider.stream(
+            messages: [.user("second")], tools: nil, systemPrompt: nil
+        ))
+
+        let firstStart = events2.compactMap { event -> Int? in
+            if case .toolCallStart(let i, _, _) = event { return i }
+            return nil
+        }.first
+        #expect(firstStart == 0, "turn 2 must allocate index 0; got \(String(describing: firstStart)) — actor-state leak from turn 1")
+
+        // And the terminal `tool_use` for toolu_x in turn 2 must take the
+        // streaming path (using turn 2's freshly allocated id mapping),
+        // emitting `toolCallArgumentsFinal` — not the legacy synth which
+        // would re-emit `toolCallStart`.
+        let starts2 = events2.filter { if case .toolCallStart = $0 { true } else { false } }
+        #expect(starts2.count == 1, "turn 2 must not synthesize a second toolCallStart — id mapping resolved cleanly")
+    }
+
+    @Test func partialForUnknownIdIsDropped() async {
+        defer { MockURLProtocol.uninstall() }
+        // Defensive: if the agent ever emits a `tool_use_input_partial`
+        // without a matching `tool_use_start` (protocol violation), we
+        // must not silently route it under the latest open block or to a
+        // synthetic index — we drop it.
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_real","name":"search"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_GHOST","partialInput":"{\\"q\\":\\"x\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_real","name":"search","input":{"q":"r"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("x")], tools: nil, systemPrompt: nil
+        ))
+
+        // No toolCallArgumentDelta should have been emitted — the ghost
+        // partial was dropped. Sequence: start → argsFinal → stop → done.
+        let deltas = events.filter {
+            if case .toolCallArgumentDelta = $0 { true } else { false }
+        }
+        #expect(deltas.isEmpty)
+        if case .toolCallArgumentsFinal(_, let args) = events[1] {
+            #expect(args == .object(["q": .string("r")]))
+        } else {
+            Issue.record("expected .toolCallArgumentsFinal at index 1, got \(events[1])")
         }
     }
 

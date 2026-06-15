@@ -35,7 +35,16 @@ public actor MetabindAgentProvider: LLMProvider {
     /// Server-assigned after the first `message_start`; echoed on subsequent
     /// turns so the proxy merges history against its Redis-stored record.
     private var conversationId: String?
-    private var toolIndexCounter = 0
+
+    /// Per-turn state for tool-use index allocation and id→index resolution.
+    /// Lives inside `run(...)` so a turn that ends via error, cancellation,
+    /// or a non-tool_use stop after `tool_use_start` cannot leak stale ids
+    /// into the next turn — where a coincidentally reused id would route
+    /// a partial to an accumulator the assistant never opened.
+    private struct TurnState {
+        var toolIndexCounter: Int = 0
+        var toolUseIndexById: [String: Int] = [:]
+    }
 
     public init(
         baseURL: URL = MetabindAgentProvider.productionHost,
@@ -62,9 +71,10 @@ public actor MetabindAgentProvider: LLMProvider {
     }
 
     /// Drop the stored conversation id so the next turn starts fresh.
+    /// (Per-turn tool-index state lives inside `run(...)` and resets
+    /// automatically; nothing actor-scoped to clear there.)
     public func resetConversation() async {
         conversationId = nil
-        toolIndexCounter = 0
     }
 
     // MARK: - LLMProvider
@@ -140,6 +150,7 @@ public actor MetabindAgentProvider: LLMProvider {
         // end-of-stream. Heartbeats (`:` comments) are skipped.
         var pendingEvent: String?
         var pendingData = ""
+        var turnState = TurnState()
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
@@ -151,6 +162,7 @@ public actor MetabindAgentProvider: LLMProvider {
                     let terminal = handleFrame(
                         name: name,
                         data: pendingData,
+                        state: &turnState,
                         continuation: continuation
                     )
                     if terminal { return }
@@ -166,7 +178,7 @@ public actor MetabindAgentProvider: LLMProvider {
         }
 
         if let name = pendingEvent {
-            _ = handleFrame(name: name, data: pendingData, continuation: continuation)
+            _ = handleFrame(name: name, data: pendingData, state: &turnState, continuation: continuation)
         }
     }
 
@@ -174,6 +186,7 @@ public actor MetabindAgentProvider: LLMProvider {
     private func handleFrame(
         name: String,
         data: String,
+        state: inout TurnState,
         continuation: AsyncStream<LLMEvent>.Continuation
     ) -> Bool {
         guard let bytes = data.data(using: .utf8),
@@ -197,22 +210,69 @@ public actor MetabindAgentProvider: LLMProvider {
             }
             return false
 
+        case "tool_use_start":
+            guard let id = json["id"] as? String,
+                  let toolName = json["name"] as? String else {
+                Self.log.warning("SSE tool_use_start missing id/name: \(data, privacy: .public)")
+                return false
+            }
+            let index = state.toolIndexCounter
+            state.toolIndexCounter += 1
+            state.toolUseIndexById[id] = index
+            Self.log.info("SSE tool_use_start name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public)")
+            continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
+            return false
+
+        case "tool_use_input_partial":
+            guard let id = json["id"] as? String,
+                  let partial = json["partialInput"] as? String else {
+                Self.log.warning("SSE tool_use_input_partial missing id/partialInput: \(data, privacy: .public)")
+                return false
+            }
+            guard let index = state.toolUseIndexById[id] else {
+                // No matching tool_use_start. Protocol violation by the
+                // agent — drop the fragment rather than routing to the
+                // "latest" tool, which would mis-attribute it under
+                // id-tagged interleaving.
+                Self.log.warning("SSE tool_use_input_partial for unknown id=\(id, privacy: .public); dropping")
+                return false
+            }
+            Self.log.debug("SSE tool_use_input_partial id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(partial.count, privacy: .public)")
+            continuation.yield(.toolCallArgumentDelta(index: index, fragment: partial))
+            return false
+
         case "tool_use":
             guard let id = json["id"] as? String,
                   let toolName = json["name"] as? String else {
                 Self.log.warning("SSE tool_use missing id/name: \(data, privacy: .public)")
                 return false
             }
-            let index = toolIndexCounter
-            toolIndexCounter += 1
             let input = json["input"] ?? [String: Any]()
+            let canonical = JSONValue.from(input)
             let inputJson = (try? JSONSerialization.data(withJSONObject: input))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "<unencodable>"
-            Self.log.info("SSE tool_use name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
-            Self.log.info("SSE tool_use input id=\(id, privacy: .public) input=\(Self.truncate(inputJson, 1500), privacy: .public)")
-            continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
-            continuation.yield(.toolCallArgumentDelta(inputJson))
-            continuation.yield(.contentBlockStop(index: index))
+
+            if let index = state.toolUseIndexById.removeValue(forKey: id) {
+                // Streaming path: tool_use_start + 0..N tool_use_input_partial
+                // already ran. The terminal `input` is authoritative — emit
+                // it as `toolCallArgumentsFinal` so the assistant uses it
+                // even when partials were absent or didn't concatenate
+                // (e.g. agent → OpenAI late-id case).
+                Self.log.info("SSE tool_use (terminal) name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
+                continuation.yield(.toolCallArgumentsFinal(index: index, arguments: canonical))
+                continuation.yield(.contentBlockStop(index: index))
+            } else {
+                // Legacy path: older agent / non-streaming provider emitted
+                // only the terminal `tool_use`. Synthesize Start/Final/Stop
+                // so the bubble renders identically.
+                let index = state.toolIndexCounter
+                state.toolIndexCounter += 1
+                Self.log.info("SSE tool_use (one-shot) name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
+                Self.log.info("SSE tool_use input id=\(id, privacy: .public) input=\(Self.truncate(inputJson, 1500), privacy: .public)")
+                continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
+                continuation.yield(.toolCallArgumentsFinal(index: index, arguments: canonical))
+                continuation.yield(.contentBlockStop(index: index))
+            }
             return false
 
         case "tool_result":

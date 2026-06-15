@@ -368,12 +368,29 @@ public final class MetabindAssistant {
         let id: String
         let name: String
         var jsonFragment: String = ""
+        /// Authoritative parsed args, when the provider sent a
+        /// `toolCallArgumentsFinal` frame. Wins over `jsonFragment` parse
+        /// because partials may be absent or non-concatenating in some
+        /// provider paths (e.g. agent → OpenAI late-id).
+        var canonicalArgs: JSONValue?
 
         var arguments: JSONValue {
+            if let canonicalArgs { return canonicalArgs }
             guard let data = jsonFragment.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return .object([:]) }
             return JSONValue.from(obj)
+        }
+
+        /// True once usable arguments have arrived — either a canonical
+        /// `toolCallArgumentsFinal` frame or a `jsonFragment` that parses to a
+        /// JSON object. The end-of-stream sweep uses this to avoid shipping a
+        /// tool call we only ever saw a `toolCallStart` for (e.g. the agent
+        /// opened a tool block, then ended the turn without a terminal frame).
+        var hasArguments: Bool {
+            if canonicalArgs != nil { return true }
+            guard let data = jsonFragment.data(using: .utf8) else { return false }
+            return (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
         }
     }
 
@@ -435,15 +452,31 @@ public final class MetabindAssistant {
                 activeSessions[id] = session
                 conversation.append(.tool(session))
 
-            case .toolCallArgumentDelta(let fragment):
-                guard let lastKey = toolAccumulators.keys.sorted().last else { break }
-                toolAccumulators[lastKey]?.jsonFragment += fragment
+            case .toolCallArgumentDelta(let index, let fragment):
+                guard toolAccumulators[index] != nil else {
+                    log.warning("toolCallArgumentDelta for unknown index=\(index, privacy: .public); dropping")
+                    break
+                }
+                toolAccumulators[index]?.jsonFragment += fragment
 
-                if let acc = toolAccumulators[lastKey],
+                if let acc = toolAccumulators[index],
                    let session = activeSessions[acc.id],
                    let data = acc.jsonFragment.data(using: .utf8),
                    let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     session.feed(JSONValue.from(parsed))
+                }
+
+            case .toolCallArgumentsFinal(let index, let args):
+                guard toolAccumulators[index] != nil else {
+                    log.warning("toolCallArgumentsFinal for unknown index=\(index, privacy: .public); dropping")
+                    break
+                }
+                toolAccumulators[index]?.canonicalArgs = args
+                if let acc = toolAccumulators[index],
+                   let session = activeSessions[acc.id] {
+                    // Surface the canonical args to the live BindJS view —
+                    // matters when partials were absent or didn't parse.
+                    session.feed(args)
                 }
 
             case .contentBlockStop(let index):
@@ -459,13 +492,26 @@ public final class MetabindAssistant {
 
             case .done:
                 for (_, acc) in toolAccumulators.sorted(by: { $0.key < $1.key }) {
-                    if !toolCalls.contains(where: { $0.id == acc.id }) {
-                        toolCalls.append(LLMToolCall(
-                            id: acc.id,
-                            name: acc.name,
-                            arguments: acc.arguments
+                    guard !toolCalls.contains(where: { $0.id == acc.id }) else { continue }
+                    guard acc.hasArguments else {
+                        // `toolCallStart` opened a bubble but no arguments ever
+                        // arrived (no terminal frame / contentBlockStop before
+                        // the turn ended). Don't ship an empty-args tool call
+                        // into history — a local loop would execute it — and
+                        // surface the stranded bubble as failed instead of
+                        // leaving it spinning.
+                        log.warning("dropping incomplete tool call id=\(acc.id, privacy: .public) name=\(acc.name, privacy: .public) — toolCallStart with no arguments at end of stream")
+                        activeSessions[acc.id]?.complete(with: ToolResult(
+                            text: "Tool call did not complete",
+                            isError: true
                         ))
+                        continue
                     }
+                    toolCalls.append(LLMToolCall(
+                        id: acc.id,
+                        name: acc.name,
+                        arguments: acc.arguments
+                    ))
                 }
                 // The agent signalled end-of-turn. Exit immediately instead
                 // of waiting for the byte stream to close — the Metabind

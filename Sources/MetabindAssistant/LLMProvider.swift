@@ -114,8 +114,22 @@ public enum LLMEvent: Sendable {
     /// A tool call has started. Argument deltas will follow.
     case toolCallStart(index: Int, id: String, name: String)
 
-    /// A fragment of the current tool call's argument JSON.
-    case toolCallArgumentDelta(String)
+    /// A fragment of a tool call's argument JSON. Routed by `index` to the
+    /// matching accumulator opened by ``toolCallStart(index:id:name:)``.
+    /// Providers must pass the index explicitly — assistants don't infer
+    /// "the latest open block," since the provider-agnostic agent contract
+    /// permits id-tagged interleaving across content blocks.
+    case toolCallArgumentDelta(index: Int, fragment: String)
+
+    /// Canonical, fully-parsed arguments for a tool call. Optional override
+    /// emitted by providers that send a terminal authoritative input (e.g.
+    /// the Metabind Agent's `tool_use` frame after `tool_use_input_partial`
+    /// streaming). When present, the assistant prefers this over the
+    /// accumulated `toolCallArgumentDelta` buffer — covering the cases
+    /// where partials are absent, lossy, or fail to concatenate to valid
+    /// JSON. Providers that don't send a terminal frame (e.g. BYOK
+    /// Anthropic) simply never emit this event.
+    case toolCallArgumentsFinal(index: Int, arguments: JSONValue)
 
     /// The content block at the given index has finished.
     case contentBlockStop(index: Int)

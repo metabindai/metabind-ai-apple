@@ -15,6 +15,7 @@ public struct AnthropicProvider: LLMProvider {
     public let apiKey: String
     public let model: String
     public let maxTokens: Int
+    private let urlSession: URLSession
 
     private static let apiURL = URL(string: "https://api.anthropic.com/v1/messages")!
     private static let log = Logger(subsystem: "MetabindAssistant", category: "Anthropic")
@@ -25,10 +26,17 @@ public struct AnthropicProvider: LLMProvider {
     ///   - apiKey: Your Anthropic API key.
     ///   - model: The model identifier.
     ///   - maxTokens: Maximum tokens in the response.
-    public init(apiKey: String, model: String = "claude-sonnet-4-20250514", maxTokens: Int = 8192) {
+    ///   - urlSession: Transport, injectable for tests. Defaults to `.shared`.
+    public init(
+        apiKey: String,
+        model: String = "claude-sonnet-4-20250514",
+        maxTokens: Int = 8192,
+        urlSession: URLSession = .shared
+    ) {
         self.apiKey = apiKey
         self.model = model
         self.maxTokens = maxTokens
+        self.urlSession = urlSession
     }
 
     public func stream(
@@ -87,7 +95,7 @@ public struct AnthropicProvider: LLMProvider {
 
         Self.log.debug("Streaming: model=\(model), messages=\(messages.count)")
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await urlSession.bytes(for: request)
 
         guard let http = response as? HTTPURLResponse else {
             throw AnthropicError.invalidResponse
@@ -141,7 +149,16 @@ public struct AnthropicProvider: LLMProvider {
                         continuation.yield(.textDelta(text))
                     }
                     if let partial = delta["partial_json"] as? String {
-                        continuation.yield(.toolCallArgumentDelta(partial))
+                        if let index = json["index"] as? Int {
+                            continuation.yield(.toolCallArgumentDelta(index: index, fragment: partial))
+                        } else {
+                            // Anthropic always tags content_block_delta with an
+                            // integer `index`. If a gateway ever strips it we
+                            // cannot route the fragment to the right
+                            // accumulator — drop it loudly rather than silently
+                            // mis-attributing it to another tool block.
+                            Self.log.warning("content_block_delta has partial_json but no integer index; dropping fragment")
+                        }
                     }
                 }
 

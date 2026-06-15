@@ -96,7 +96,7 @@ struct MetabindAssistantRemoteLoopTests {
         let events: [LLMEvent] = [
             .textDelta("Looking it up. "),
             .toolCallStart(index: 0, id: "toolu_1", name: "getWeather"),
-            .toolCallArgumentDelta(#"{"city":"NYC"}"#),
+            .toolCallArgumentDelta(index: 0, fragment: #"{"city":"NYC"}"#),
             .contentBlockStop(index: 0),
             .toolResult(
                 toolCallId: "toolu_1",
@@ -256,6 +256,39 @@ struct MetabindAssistantRemoteLoopTests {
         //  verify via the FakeProvider's recorded invocations on the NEXT
         //  send. Skipping for this test since one turn suffices to prove
         //  the bubble-splitting behavior.)
+    }
+
+    @Test func incompleteToolCallWithoutArgumentsIsDroppedAtEndOfStream() async {
+        // Defensive (MET-1197 follow-up): a provider opens a tool block via
+        // `toolCallStart` but the turn ends — no partials, no terminal frame,
+        // no `contentBlockStop` — before any arguments arrive. The
+        // end-of-stream sweep must NOT ship an empty-args tool call: a local
+        // loop would then execute it against the MCP server, and it pollutes
+        // history. The stranded bubble is surfaced as failed instead of
+        // spinning forever.
+        let turn: [LLMEvent] = [
+            .toolCallStart(index: 0, id: "orphan", name: "doThing"),
+            .done(stopReason: .endTurn),
+        ]
+        // Local loop so an erroneously-shipped tool call would reach callTool.
+        let provider = FakeProvider(runsToolsRemotely: false, turns: [turn])
+        let server = FakeMCPServer()
+        let assistant = MetabindAssistant(server: server, provider: provider)
+
+        assistant.send("go")
+        await waitUntil { !assistant.isProcessing }
+
+        #expect((await server.toolCallInvocations) == 0,
+                "an arg-less orphan tool call must not be executed")
+        #expect((await provider.recordedInvocations).count == 1,
+                "no second loop iteration should chase the phantom tool call")
+
+        let sessions = assistant.conversation.messages.compactMap { msg -> MCPAppSession? in
+            if case .tool(let session) = msg { return session }
+            return nil
+        }
+        #expect(sessions.first?.phase.isFailure == true,
+                "stranded tool bubble should be marked failed, not left loading")
     }
 
     // MARK: - Regression: local loop still works

@@ -459,11 +459,16 @@ public final class MetabindAssistant {
                 }
                 toolAccumulators[index]?.jsonFragment += fragment
 
+                // Feed a tolerant partial parse so the rendered tool UI fills in
+                // as the model streams. The accumulated buffer is strict-valid
+                // JSON only at the final fragment, so a strict parse would update
+                // the view just once (at completion); PartialJSON.parse recovers
+                // a valid JSONValue at most fragment boundaries. The authoritative
+                // value still arrives via `toolCallArgumentsFinal`.
                 if let acc = toolAccumulators[index],
                    let session = activeSessions[acc.id],
-                   let data = acc.jsonFragment.data(using: .utf8),
-                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    session.feed(JSONValue.from(parsed))
+                   let partial = PartialJSON.parse(acc.jsonFragment) {
+                    session.feed(partial)
                 }
 
             case .toolCallArgumentsFinal(let index, let args):

@@ -61,12 +61,9 @@ public struct MCPAppContent: View {
     /// Tools may wrap props under a `"content"` key (BYOK Anthropic shape) or
     /// emit them directly (Metabind Agent proxy shape). Accept either.
     private var componentArguments: [String: Any] {
-        let args: JSONValue
-        if let manual = session as? ManualMCPAppSession, let partial = manual.partialArguments {
-            args = partial
-        } else {
-            args = session.toolArguments
-        }
+        // Prefer streamed partial arguments so the UI fills in progressively;
+        // fall back to the final tool arguments once streaming is done.
+        let args = session.partialArguments ?? session.toolArguments
         guard case .object(let dict) = args else { return [:] }
         if case .object(let inner) = dict["content"] ?? .null {
             return inner.mapValues { $0.toAny() }
@@ -95,8 +92,7 @@ public struct MCPAppContent: View {
         env["displayMode"] = session.displayMode.rawValue
         env["toolArguments"] = jsonString(session.toolArguments)
 
-        if let manual = session as? ManualMCPAppSession,
-           let partial = manual.partialArguments {
+        if let partial = session.partialArguments {
             env["partialArguments"] = jsonString(partial)
         }
 

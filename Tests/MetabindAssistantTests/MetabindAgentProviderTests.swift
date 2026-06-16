@@ -155,6 +155,66 @@ struct MetabindAgentProviderTests {
         }
     }
 
+    @Test func streamedToolInputForwardsPartialDeltasThenClosesOnce() async {
+        defer { MockURLProtocol.uninstall() }
+        // MET-1093: the proxy forwards tool input incrementally — a
+        // `tool_use_start`, N `tool_use_input_partial` fragments, then the
+        // trailing atomic `tool_use`. The client must open the block, forward
+        // each fragment as an argument delta, and close exactly once (without
+        // re-emitting the whole input, which would corrupt the accumulator).
+        let sse = """
+        event: message_start
+        data: {"conversationId":"conv-1"}
+
+        event: tool_use_start
+        data: {"id":"toolu_1","name":"getWeather"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"{\\"ci"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"ty\\":\\"NY"}
+
+        event: tool_use_input_partial
+        data: {"id":"toolu_1","partialInput":"C\\"}"}
+
+        event: tool_use
+        data: {"id":"toolu_1","name":"getWeather","input":{"city":"NYC"}}
+
+        event: message_stop
+        data: {"stopReason":"end_turn"}
+
+
+        """
+        let events = await collect(makeProvider(sse: sse).stream(
+            messages: [.user("weather?")], tools: nil, systemPrompt: nil
+        ))
+
+        // toolCallStart, 3× toolCallArgumentDelta, contentBlockStop, done
+        guard case .toolCallStart(let index, let id, let name) = events.first else {
+            Issue.record("expected .toolCallStart, got \(String(describing: events.first))")
+            return
+        }
+        #expect(index == 0)
+        #expect(id == "toolu_1")
+        #expect(name == "getWeather")
+
+        let deltas = events.compactMap { event -> String? in
+            if case .toolCallArgumentDelta(let d) = event { return d }
+            return nil
+        }
+        #expect(deltas.count == 3)
+        // The fragments concatenate into the exact input JSON — proving we did
+        // NOT also re-emit the whole `tool_use` input on top of the partials.
+        #expect(deltas.joined() == #"{"city":"NYC"}"#)
+
+        let stops = events.filter { if case .contentBlockStop = $0 { return true }; return false }
+        #expect(stops.count == 1)
+        if case .contentBlockStop(let stopIndex) = stops.first {
+            #expect(stopIndex == 0)
+        }
+    }
+
     @Test func toolResultRoundTripsStructuredContent() async {
         defer { MockURLProtocol.uninstall() }
         let sse = """

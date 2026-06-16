@@ -36,6 +36,12 @@ public actor MetabindAgentProvider: LLMProvider {
     /// turns so the proxy merges history against its Redis-stored record.
     private var conversationId: String?
     private var toolIndexCounter = 0
+    /// Tool-call id → assigned block index, for tools whose input is streaming
+    /// in via `tool_use_start` + `tool_use_input_partial`. An entry is removed
+    /// when the trailing atomic `tool_use` closes the block. Lets the final
+    /// `tool_use` distinguish "already streamed — just close it" from the
+    /// legacy "whole input arrives at once" path.
+    private var streamedToolIndices: [String: Int] = [:]
 
     public init(
         baseURL: URL = MetabindAgentProvider.productionHost,
@@ -65,6 +71,7 @@ public actor MetabindAgentProvider: LLMProvider {
     public func resetConversation() async {
         conversationId = nil
         toolIndexCounter = 0
+        streamedToolIndices.removeAll()
     }
 
     // MARK: - LLMProvider
@@ -197,22 +204,67 @@ public actor MetabindAgentProvider: LLMProvider {
             }
             return false
 
+        case "tool_use_start":
+            // MET-1093: the model has begun a tool call but its input is still
+            // streaming. Open the block now so the renderer shows an in-progress
+            // card immediately instead of waiting out the (sometimes tens of
+            // seconds) it takes to stream a large input.
+            guard let id = json["id"] as? String,
+                  let toolName = json["name"] as? String else {
+                Self.log.warning("SSE tool_use_start missing id/name: \(data, privacy: .public)")
+                return false
+            }
+            let index = toolIndexCounter
+            toolIndexCounter += 1
+            streamedToolIndices[id] = index
+            Self.log.info("SSE tool_use_start name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public)")
+            continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
+            return false
+
+        case "tool_use_input_partial":
+            // MET-1093: an unhealed fragment of the current tool's input JSON.
+            // Forward it as an argument delta; the assistant appends to the
+            // matching accumulator and renders a tolerant partial parse.
+            guard let id = json["id"] as? String,
+                  let partial = json["partialInput"] as? String else {
+                Self.log.warning("SSE tool_use_input_partial missing id/partialInput: \(data, privacy: .public)")
+                return false
+            }
+            guard streamedToolIndices[id] != nil else {
+                Self.log.warning("SSE tool_use_input_partial for unstarted id=\(id, privacy: .public)")
+                return false
+            }
+            continuation.yield(.toolCallArgumentDelta(partial))
+            return false
+
         case "tool_use":
             guard let id = json["id"] as? String,
                   let toolName = json["name"] as? String else {
                 Self.log.warning("SSE tool_use missing id/name: \(data, privacy: .public)")
                 return false
             }
-            let index = toolIndexCounter
-            toolIndexCounter += 1
             let input = json["input"] ?? [String: Any]()
             let inputJson = (try? JSONSerialization.data(withJSONObject: input))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "<unencodable>"
-            Self.log.info("SSE tool_use name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
-            Self.log.info("SSE tool_use input id=\(id, privacy: .public) input=\(Self.truncate(inputJson, 1500), privacy: .public)")
-            continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
-            continuation.yield(.toolCallArgumentDelta(inputJson))
-            continuation.yield(.contentBlockStop(index: index))
+
+            if let index = streamedToolIndices.removeValue(forKey: id) {
+                // Streamed path: start + partials already emitted, so the
+                // assistant's accumulator already holds the full input JSON.
+                // Re-emitting the whole input here would corrupt that buffer
+                // (append-after-complete), so just close the block.
+                Self.log.info("SSE tool_use (streamed) name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
+                continuation.yield(.contentBlockStop(index: index))
+            } else {
+                // Legacy path: no start/partials were forwarded — the whole
+                // input arrives atomically. Emit the full block in one shot.
+                let index = toolIndexCounter
+                toolIndexCounter += 1
+                Self.log.info("SSE tool_use (atomic) name=\(toolName, privacy: .public) id=\(id, privacy: .public) index=\(index, privacy: .public) bytes=\(inputJson.count, privacy: .public)")
+                Self.log.info("SSE tool_use input id=\(id, privacy: .public) input=\(Self.truncate(inputJson, 1500), privacy: .public)")
+                continuation.yield(.toolCallStart(index: index, id: id, name: toolName))
+                continuation.yield(.toolCallArgumentDelta(inputJson))
+                continuation.yield(.contentBlockStop(index: index))
+            }
             return false
 
         case "tool_result":

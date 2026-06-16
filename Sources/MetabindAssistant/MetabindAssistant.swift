@@ -370,10 +370,12 @@ public final class MetabindAssistant {
         var jsonFragment: String = ""
 
         var arguments: JSONValue {
-            guard let data = jsonFragment.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return .object([:]) }
-            return JSONValue.from(obj)
+            if let data = jsonFragment.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                return JSONValue.from(obj)
+            }
+            // Stream ended before the buffer was strict-valid — salvage what arrived.
+            return PartialJSON.parse(jsonFragment) ?? .object([:])
         }
     }
 
@@ -439,11 +441,16 @@ public final class MetabindAssistant {
                 guard let lastKey = toolAccumulators.keys.sorted().last else { break }
                 toolAccumulators[lastKey]?.jsonFragment += fragment
 
+                // Feed a tolerant partial parse so the rendered tool UI fills in
+                // as the model streams. Anthropic emits `partial_json` in ~7-char
+                // fragments whose accumulation is strict-valid JSON only at the
+                // final token, so a strict parse here would update the view just
+                // once (at completion). `PartialJSON.parse` recovers a valid
+                // JSONValue at most fragment boundaries.
                 if let acc = toolAccumulators[lastKey],
                    let session = activeSessions[acc.id],
-                   let data = acc.jsonFragment.data(using: .utf8),
-                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    session.feed(JSONValue.from(parsed))
+                   let partial = PartialJSON.parse(acc.jsonFragment) {
+                    session.feed(partial)
                 }
 
             case .contentBlockStop(let index):

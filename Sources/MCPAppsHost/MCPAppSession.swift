@@ -34,6 +34,13 @@ public class MCPAppSession: Identifiable {
     /// Current display mode.
     public internal(set) var displayMode: DisplayMode = .inline
 
+    /// The latest partial tool arguments streamed into this session, or nil if
+    /// none have been fed. Populated only by `ManualMCPAppSession.feed(_:)` as a
+    /// tool call streams in; declared here so it lives on the `@Observable` base
+    /// and a feed invalidates observing views. Read it via `MCPAppContent` to
+    /// render the tool UI progressively.
+    public internal(set) var partialArguments: JSONValue?
+
     /// Sendable model-layer phase. No view content.
     public enum Phase: Sendable {
         case loading

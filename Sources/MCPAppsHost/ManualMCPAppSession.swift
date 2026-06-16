@@ -16,9 +16,6 @@ import Foundation
 ///
 public final class ManualMCPAppSession: MCPAppSession {
 
-    /// The latest partial arguments fed to this session.
-    public private(set) var partialArguments: JSONValue?
-
     public override init(toolCall: some MCPToolCall, server: some MCPServer, resolvers: [any ContentResolver] = defaultResolvers) {
         super.init(toolCall: toolCall, server: server, resolvers: resolvers, autoExecute: false)
     }
